@@ -18,9 +18,12 @@ LANGUAGE = "eng"
 LOG_DIR = File.join(OUTPUT_DIR, "logs")
 FileUtils.mkdir_p(LOG_DIR)
 
+CYGWIN = `uname`.downcase.include?("cygwin")
+STDOUT.sync = true
+STDERR.sync = true
 Process.setpriority(Process::PRIO_PROCESS, 0, Process::BELOW_NORMAL_PRIORITY_CLASS)
 
-disc_paths = ARGV.sort
+disc_paths = ARGV.sort_by { |p| p.gsub(/\d+/) { |s| "%04d" % s.to_i } }
 if(disc_paths.empty?)
   puts "Must pass paths to discs as arguments"
   exit 1
@@ -58,6 +61,7 @@ def scan_disc(disc_path)
   )
   if(status != 0)
     puts "Scan failed"
+    puts scan_output
     exit 1
   end
 
@@ -138,7 +142,7 @@ def select_episodes(season_key, season_titles, force_add, force_remove)
       match = false
     elsif(title[:duration] >= min_duration && title[:duration] <= max_duration)
       seen_blocks_key = [title[:disc_path], title[:blocks]].join("-")
-      if(title[:subtitles].to_s.empty?)
+      if(title[:subtitles].to_s.empty? && ENV["ALLOW_NO_SUBTITLES"] != "true")
         puts "WARNING: Subtitles empty, skipping: #{title.inspect}"
       elsif(seen_blocks[seen_blocks_key])
         puts "WARNING: Apparent duplicate title (same block count), skipping: #{title.inspect}, Previously seen: #{seen_blocks[seen_blocks_key].inspect}"
@@ -177,6 +181,23 @@ def select_episodes(season_key, season_titles, force_add, force_remove)
 end
 
 disc_paths.each do |disc_path|
+  if(CYGWIN)
+    output, status = Open3.capture2e(
+      "cygpath",
+      "--absolute",
+      "--windows",
+      disc_path,
+    )
+    if(status == 0)
+      disc_path = output.strip
+    else
+      puts "cypath failed"
+      puts output
+      exit 1
+    end
+  end
+
+  disc_path = File.realpath(disc_path)
   puts "Scanning #{disc_path}..."
   scan_disc(disc_path)
 end
