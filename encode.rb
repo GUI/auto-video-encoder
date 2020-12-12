@@ -5,15 +5,17 @@ require "bundler/setup"
 require "active_support"
 require "benchmark"
 require "childprocess"
+require "digest"
 require "fileutils"
 require "highline"
+require "json"
 require "open3"
 require "time"
 require "win32-process"
 
 require_relative "./settings.rb"
 
-MIN_SCAN_DURATION = 5 * 60
+MIN_SCAN_DURATION = (ENV["MIN_SCAN_DURATION"] || 5).to_i * 60
 LANGUAGE = "eng"
 LOG_DIR = File.join(OUTPUT_DIR, "logs")
 FileUtils.mkdir_p(LOG_DIR)
@@ -23,7 +25,9 @@ STDOUT.sync = true
 STDERR.sync = true
 Process.setpriority(Process::PRIO_PROCESS, 0, Process::BELOW_NORMAL_PRIORITY_CLASS)
 
+puts ARGV.inspect
 disc_paths = ARGV.sort_by { |p| p.gsub(/\d+/) { |s| "%04d" % s.to_i } }
+puts disc_paths.inspect
 if(disc_paths.empty?)
   puts "Must pass paths to discs as arguments"
   exit 1
@@ -52,38 +56,43 @@ def scan_disc(disc_path)
     disc_num = $2
   end
 
-  scan_output, status = Open3.capture2e(
+  scan_output, scan_err, status = Open3.capture3(
     CLI_PATH,
     "--input", disc_path,
     "--title", "0",
     "--min-duration", MIN_SCAN_DURATION.to_s,
     "--scan",
+    "--json",
   )
   if(status != 0)
     puts "Scan failed"
     puts scan_output
+    puts scan_err
     exit 1
   end
 
-  disc_titles = scan_output.scan(/^(\+ title.*?)(?=^\+ |\z|has exited)/m)
-  disc_titles.each do |title|
-    title = title.join
-    title_num = title.match(/^\+ title (\d+)/)[1]
+  data = JSON.load(scan_output.match(/JSON Title Set: ({.*)\z/m)[1])
+  data.fetch("TitleList").each do |title_list|
+    title_num = title_list.fetch("Index").to_s
 
-    duration = title.match(/^  \+ duration: ([0-9:]+)/)[1]
-    duration = Time.strptime(duration, "%H:%M:%S")
-    duration = duration.hour * 60 * 60 + duration.min * 60 + duration.sec
-    blocks = title.match(/^  \+ .* \(([0-9]+) blocks\)$/)[1].to_i
+    duration = title_list.fetch("Duration").fetch("Hours") * 60 * 60 + title_list.fetch("Duration").fetch("Minutes") * 60 + title_list.fetch("Duration").fetch("Seconds")
 
-    subtitles = title.match(/^  \+ subtitle tracks:(.*?)(?=^  \+|\z)/m)[1]
-    subtitles = subtitles.scan(/^    \+ (\d+).*iso639-2: (\w+)/).map do |subtitle|
-      {
-        :index => subtitle[0],
-        :language => subtitle[1],
-      }
+    ticks = title_list.fetch("Duration").fetch("Ticks")
+    chapter_ticks = title_list.fetch("ChapterList").map { |chapter| chapter.fetch("Duration").fetch("Ticks") }
+    checksum = Digest::SHA256.hexdigest("#{ticks}#{chapter_ticks.join(",")}")[0, 8]
+
+    language_subtitles = []
+    title_list.fetch("SubtitleList").each_with_index do |subtitle, index|
+      if subtitle.fetch("LanguageCode") == LANGUAGE
+        language_subtitles << index + 1
+      end
     end
-    subtitles.select! do |subtitle|
-      subtitle[:language] == LANGUAGE
+    if(language_subtitles.empty?)
+      title_list.fetch("SubtitleList").each_with_index do |subtitle, index|
+        if subtitle.fetch("LanguageCode") == "und"
+          language_subtitles << index + 1
+        end
+      end
     end
 
     season_key = { :series => series, :season => season }
@@ -96,10 +105,11 @@ def scan_disc(disc_path)
       :disc_num => disc_num,
       :num => title_num,
       :disc_title_num => [disc_num.rjust(2, "0"), title_num.rjust(2, "0")].join("-"),
-      :blocks => blocks,
+      :ticks => ticks,
+      :checksum => checksum,
       :duration => duration,
       :human_duration => "#{Time.at(duration).utc.strftime("%H:%M:%S")} #{humanize_duration(duration)}",
-      :subtitles => subtitles.map { |s| s[:index] }.join(","),
+      :subtitles => language_subtitles.join(","),
     }
   end
 end
@@ -107,7 +117,7 @@ end
 def select_episodes(season_key, season_titles, force_add, force_remove)
   puts "\n#{season_key[:series]} S#{season_key[:season]} all titles:"
   season_titles.each do |title|
-    puts "#{title[:disc_name]} Title #{title[:disc_title_num]}: #{title[:human_duration]} (#{title[:blocks]} blocks)"
+    puts "#{title[:disc_name]} Title #{title[:disc_title_num]}: #{title[:human_duration]} (#{title[:ticks]} ticks, checksum: #{title[:checksum]})"
   end
   puts "\n"
 
@@ -133,7 +143,7 @@ def select_episodes(season_key, season_titles, force_add, force_remove)
   season = $cli.ask("Season: ", Integer) { |q| q.default = season_key[:season] || "1" }
   starting_episode = $cli.ask("Starting Episode: ", Integer) { |q| q.default = "1" }
 
-  seen_blocks = {}
+  seen_checksums = {}
   matched_titles = season_titles.select do |title|
     match = false
     if(force_add && force_add.include?(title[:disc_title_num]))
@@ -141,13 +151,13 @@ def select_episodes(season_key, season_titles, force_add, force_remove)
     elsif(force_remove && force_remove.include?(title[:disc_title_num]))
       match = false
     elsif(title[:duration] >= min_duration && title[:duration] <= max_duration)
-      seen_blocks_key = [title[:disc_path], title[:blocks]].join("-")
+      seen_checksum_key = [title[:disc_path], title[:checksum]].join("-")
       if(title[:subtitles].to_s.empty? && ENV["ALLOW_NO_SUBTITLES"] != "true")
         puts "WARNING: Subtitles empty, skipping: #{title.inspect}"
-      elsif(seen_blocks[seen_blocks_key])
-        puts "WARNING: Apparent duplicate title (same block count), skipping: #{title.inspect}, Previously seen: #{seen_blocks[seen_blocks_key].inspect}"
+      elsif(seen_checksums[seen_checksum_key])
+        puts "WARNING: Apparent duplicate title (same tick count), skipping: #{title.inspect}, Previously seen: #{seen_checksums[seen_checksum_key].inspect}"
       else
-        seen_blocks[seen_blocks_key] = title
+        seen_checksums[seen_checksum_key] = title
         match = true
       end
     end
@@ -181,6 +191,7 @@ def select_episodes(season_key, season_titles, force_add, force_remove)
 end
 
 disc_paths.each do |disc_path|
+	puts disc_path.inspect
   if(CYGWIN)
     output, status = Open3.capture2e(
       "cygpath",
@@ -188,6 +199,7 @@ disc_paths.each do |disc_path|
       "--windows",
       disc_path,
     )
+	puts output.inspect
     if(status == 0)
       disc_path = output.strip
     else
@@ -250,8 +262,9 @@ encode_titles.each_with_index do |title, index|
     "--turbo",
     "--cfr",
     "--audio-lang-list", LANGUAGE,
-    "--first-audio",
-    "--aencoder", "av_aac",
+    "--all-audio",
+    "--aencoder", "copy",
+    "--audio-fallback", "av_aac",
     "--ab", "192",
     "--mixdown", "dpl2",
     "--crop", "0:0:0:0",
