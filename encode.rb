@@ -11,23 +11,20 @@ require "highline"
 require "json"
 require "open3"
 require "time"
-require "win32-process"
 
 require_relative "./settings.rb"
+
+Dir.chdir(CHDIR)
 
 MIN_SCAN_DURATION = (ENV["MIN_SCAN_DURATION"] || 5).to_i * 60
 LANGUAGE = "eng"
 LOG_DIR = File.join(OUTPUT_DIR, "logs")
 FileUtils.mkdir_p(LOG_DIR)
 
-CYGWIN = `uname`.downcase.include?("cygwin")
 STDOUT.sync = true
 STDERR.sync = true
-Process.setpriority(Process::PRIO_PROCESS, 0, Process::BELOW_NORMAL_PRIORITY_CLASS)
 
-puts ARGV.inspect
 disc_paths = ARGV.sort_by { |p| p.gsub(/\d+/) { |s| "%04d" % s.to_i } }
-puts disc_paths.inspect
 if(disc_paths.empty?)
   puts "Must pass paths to discs as arguments"
   exit 1
@@ -56,14 +53,14 @@ def scan_disc(disc_path)
     disc_num = $2
   end
 
-  scan_output, scan_err, status = Open3.capture3(
+  scan_output, scan_err, status = Open3.capture3(*[
     CLI_PATH,
     "--input", disc_path,
     "--title", "0",
     "--min-duration", MIN_SCAN_DURATION.to_s,
     "--scan",
     "--json",
-  )
+  ].flatten)
   if(status != 0)
     puts "Scan failed"
     puts scan_output
@@ -191,25 +188,10 @@ def select_episodes(season_key, season_titles, force_add, force_remove)
 end
 
 disc_paths.each do |disc_path|
-	puts disc_path.inspect
-  if(CYGWIN)
-    output, status = Open3.capture2e(
-      "cygpath",
-      "--absolute",
-      "--windows",
-      disc_path,
-    )
-	puts output.inspect
-    if(status == 0)
-      disc_path = output.strip
-    else
-      puts "cypath failed"
-      puts output
-      exit 1
-    end
+  REMAP_DIRS.each do |search, replace|
+    disc_path = disc_path.gsub(search, replace)
   end
 
-  disc_path = File.realpath(disc_path)
   puts "Scanning #{disc_path}..."
   scan_disc(disc_path)
 end
@@ -287,7 +269,7 @@ encode_titles.each_with_index do |title, index|
     "--subtitle", "scan,#{title[:subtitles]}",
     "--subtitle-default", "1",
     "--native-language", LANGUAGE,
-  ]
+  ].flatten
 
   progress = "\n#{(index + 1).to_s.rjust(3)}/#{encode_titles.length} - Encoding #{title[:output_filename]}..."
   puts progress
